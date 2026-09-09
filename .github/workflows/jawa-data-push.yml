@@ -1,0 +1,57 @@
+name: Jawa Daily Data Push
+
+on:
+  schedule:
+    - cron: "0 4 * * *"    # 09:30 AM IST (UTC+5:30)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — fetch, validate, but do NOT update production'
+        type: boolean
+        default: false
+
+concurrency:
+  group: jawa-data-push
+  cancel-in-progress: false  # never cancel a running push; queue instead
+
+jobs:
+  push-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas openpyxl
+
+      - name: Run Jawa data pipeline
+        env:
+          JAWA_APPS_SCRIPT_URL:    ${{ secrets.JAWA_APPS_SCRIPT_URL }}
+          JAWA_APPS_SCRIPT_SECRET: ${{ secrets.JAWA_APPS_SCRIPT_SECRET }}
+          JAWA_SHEET_ID_JUL26:     ${{ secrets.JAWA_SHEET_ID_JUL26 }}
+          JAWA_SHEET_ID_AUG26:     ${{ secrets.JAWA_SHEET_ID_AUG26 }}
+          JAWA_SHEET_ID_LIVE:      ${{ secrets.JAWA_SHEET_ID_LIVE }}
+          JAWA_RETAIL_SHEET_ID:    ${{ secrets.JAWA_RETAIL_SHEET_ID }}
+        run: python Jawa/push_jawa_data.py ${{ inputs.dry_run == true && '--dry-run' || '' }}
+
+      - name: Keep repo active and commit changes
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "Last pipeline run: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > last_run.txt
+          git add index.html
+          git add Jawa/pipeline_metrics.json 2>/dev/null || true
+          git add last_run.txt
+          git diff --cached --quiet || git commit -m "chore: jawa pipeline run $(date -u '+%Y-%m-%d')"
+          git pull --rebase
+          git push

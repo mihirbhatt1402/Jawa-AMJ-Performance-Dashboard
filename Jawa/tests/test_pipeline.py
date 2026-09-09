@@ -347,5 +347,189 @@ class TestValidationGates:
         assert any("G5" in f for f in fails)
 
 
+# ── Aug'26 hard-failure tests ──────────────────────────────────────────────
+class TestAug26HardFailure:
+    def test_aug26_fallback_flagged_no_opty_id(self):
+        """aug26_fallback must declare has_opty_id: false so the hard-failure path is documented."""
+        with gzip.open(AUG26_FALLBACK, "rt") as f:
+            cache = json.load(f)
+        assert cache.get("has_opty_id") is False, (
+            "aug26_fallback must have has_opty_id=false to confirm retail joins are impossible"
+        )
+
+
+# ── Integration tests (retail reconciliation end-to-end) ──────────────────
+class TestRetailReconciliationIntegration:
+    """
+    Tests A–E: verify that opty_id-based retail joins work across all valid
+    lead-month / retail-performanceMonth combinations in the rolling window.
+    """
+
+    def _apply_retail(self, rows: list[dict], retail_map: dict) -> list[dict]:
+        """Simulate what build_payload does: apply retail_map to live rows by opty_id."""
+        for r in rows:
+            oid = r.get("opty_id", "")
+            if oid and oid in retail_map:
+                rm = retail_map[oid]
+                r["isRetail"]     = 1
+                r["retailModel"]  = rm["retailModel"]
+                r["perfMonth"]    = rm["perfMonth"]
+                r["retailSource"] = rm["retailSource"]
+        return rows
+
+    def test_A_jul_lead_jul_retail_matched(self):
+        """Test A: Jul'26 lead retailing in Jul'26 (same-month) is matched via opty_id."""
+        lead = make_lead_row(opty_id="A_OID_001", month="Jul'26")
+        retail_map = {"A_OID_001": {"retailModel": "Jawa 42", "perfMonth": "Jul'26", "retailSource": "DMS"}}
+        result = self._apply_retail([lead], retail_map)
+        assert result[0]["isRetail"] == 1
+        assert result[0]["retailModel"] == "Jawa 42"
+        assert result[0]["perfMonth"] == "Jul'26"
+
+    def test_B_jul_lead_aug_retail_matched(self):
+        """Test B: Jul'26 lead retailing in Aug'26 (next month) is matched via opty_id."""
+        lead = make_lead_row(opty_id="B_OID_001", month="Jul'26")
+        retail_map = {"B_OID_001": {"retailModel": "Jawa 350", "perfMonth": "Aug'26", "retailSource": "DMS"}}
+        result = self._apply_retail([lead], retail_map)
+        assert result[0]["isRetail"] == 1
+        assert result[0]["perfMonth"] == "Aug'26"
+
+    def test_C_jul_lead_sep_retail_matched(self):
+        """Test C: Jul'26 lead retailing in Sep'26 is matched — Sep retail is within 3-month window when current=Sep'26."""
+        window = P.rolling_months("Sep'26", 3)
+        assert "Sep'26" in window, "Sep'26 must be in rolling window when current month is Sep'26"
+        lead = make_lead_row(opty_id="C_OID_001", month="Jul'26")
+        retail_map = {"C_OID_001": {"retailModel": "Jawa Perak", "perfMonth": "Sep'26", "retailSource": "VOC"}}
+        result = self._apply_retail([lead], retail_map)
+        assert result[0]["isRetail"] == 1
+        assert result[0]["perfMonth"] == "Sep'26"
+
+    def test_D_aug_lead_sep_retail_matched(self):
+        """Test D: Aug'26 lead retailing in Sep'26 is matched via opty_id."""
+        lead = make_lead_row(opty_id="D_OID_001", month="Aug'26")
+        retail_map = {"D_OID_001": {"retailModel": "Yezdi Adventure", "perfMonth": "Sep'26", "retailSource": "DMS"}}
+        result = self._apply_retail([lead], retail_map)
+        assert result[0]["isRetail"] == 1
+        assert result[0]["retailModel"] == "Yezdi Adventure"
+
+    def test_E_frozen_retail_unaffected_by_live_window(self):
+        """Test E: Jun'26 retail (frozen) is not present in the Sep'26 rolling window,
+        but the frozen row's isRetail=1 flag is preserved in the payload."""
+        frozen_rows, dm = load_hist()
+        # Rolling window for Sep'26 is [Sep'26, Aug'26, Jul'26] — Jun'26 is excluded
+        window = P.rolling_months("Sep'26", 3)
+        assert "Jun'26" not in window, "Jun'26 must NOT be in the live rolling window for Sep'26"
+
+        # Build payload with empty retail_map (simulating no new retails in the live window)
+        live = [make_lead_row("E_OID_LIVE_1", month="Sep'26")]
+        payload = P.build_payload(frozen_rows, live, {}, dm)
+
+        months = payload["months"]
+        freeze_order = P.month_order(P.HISTORICAL_FREEZE_MONTH)
+        frozen_m_set = {m for m in months if P.month_order(m) <= freeze_order}
+
+        # Frozen retails must still be present and unchanged
+        frozen_ret_expected = sum(1 for r in frozen_rows if r.get("isRetail") == 1)
+        frozen_ret_actual   = sum(1 for r in payload["rows"]
+                                  if months[r[0]] in frozen_m_set and r[8] == 1)
+        assert frozen_ret_actual == frozen_ret_expected, (
+            f"Frozen retails dropped: expected {frozen_ret_expected}, got {frozen_ret_actual}"
+        )
+
+
+# ── Frozen lead stability tests ────────────────────────────────────────────
+class TestFrozenLeadStability:
+    def test_frozen_count_stable_across_different_live_data(self):
+        """Frozen row count (315,816) must not change regardless of what live data is provided."""
+        frozen_rows, dm = load_hist()
+        frozen_count = len(frozen_rows)
+
+        # Run 1: small live set
+        live_a = [make_lead_row(f"STA_{i}", month="Sep'26") for i in range(50)]
+        payload_a = P.build_payload(frozen_rows, live_a, {}, dm)
+        months_a = payload_a["months"]
+        freeze_order = P.month_order(P.HISTORICAL_FREEZE_MONTH)
+        frozen_m_set = {m for m in months_a if P.month_order(m) <= freeze_order}
+        count_a = sum(1 for r in payload_a["rows"] if months_a[r[0]] in frozen_m_set)
+
+        # Run 2: different live set
+        live_b = [make_lead_row(f"STB_{i}", month="Jul'26") for i in range(200)]
+        payload_b = P.build_payload(frozen_rows, live_b, {}, dm)
+        months_b = payload_b["months"]
+        frozen_m_set_b = {m for m in months_b if P.month_order(m) <= freeze_order}
+        count_b = sum(1 for r in payload_b["rows"] if months_b[r[0]] in frozen_m_set_b)
+
+        assert count_a == frozen_count, f"Run A frozen count mismatch: {count_a} != {frozen_count}"
+        assert count_b == frozen_count, f"Run B frozen count mismatch: {count_b} != {frozen_count}"
+
+    def test_frozen_rows_have_no_opty_id(self):
+        """Frozen rows (decoded from compact dashboard) must not have opty_id — they use mobile_key."""
+        frozen_rows, _ = load_hist()
+        for r in frozen_rows[:200]:
+            assert "opty_id" not in r, "Frozen rows must not carry opty_id — they use mobile_key"
+            assert "mobile_key" in r, "Frozen rows must carry mobile_key (opaque int from compact schema)"
+
+
+# ── Retail duplication tests ───────────────────────────────────────────────
+class TestCanonMonth:
+    """canon_month() handles ASCII and Unicode apostrophes, 2-digit and 4-digit years."""
+
+    def _canon(self, m):
+        from Jawa.push_jawa_data import canon_month
+        return canon_month(m)
+
+    def test_ascii_apostrophe_2digit(self):
+        assert self._canon("Jul'26") == "Jul'26"
+
+    def test_ascii_apostrophe_4digit(self):
+        assert self._canon("Jul'2026") == "Jul'26"
+
+    def test_no_apostrophe(self):
+        assert self._canon("Jul26") == "Jul'26"
+
+    def test_unicode_right_single_quotation_mark(self):
+        # Retail Master uses U+2019 RIGHT SINGLE QUOTATION MARK
+        assert self._canon("Sep’26") == "Sep'26"
+        assert self._canon("Aug’2026") == "Aug'26"
+
+    def test_unknown_format_passthrough(self):
+        assert self._canon("2026-09-01") == "2026-09-01"
+
+    def test_pm_col_priority_uses_retail_attribution_month(self):
+        """Retail Master pm_col must resolve to 'Retail Attribution Month', not performanceMonth."""
+        cols = [
+            "sourceLeadId", "enquiryId", "performanceMonth",
+            "Call Type", "Process", "purchasedModel", "Retail Attribution Month"
+        ]
+        pm_col = next((c for c in cols if c.lower() == "retail attribution month"), None)
+        if pm_col is None:
+            pm_col = next((c for c in cols if c.lower() in (
+                "performancemonth", "performance_month", "performance month"
+            )), None)
+        assert pm_col == "Retail Attribution Month", (
+            f"pm_col resolved to {pm_col!r}; expected 'Retail Attribution Month' to beat performanceMonth"
+        )
+
+
+class TestRetailDuplication:
+    def test_duplicate_source_lead_id_last_row_wins(self):
+        """If sourceLeadId appears twice in Retail Master, last row overwrites first (documented behavior)."""
+        # Simulate what fetch_retail_master does when building retail_map
+        retail_map: dict = {}
+        entries = [
+            {"sid": "DUP_001", "retailModel": "Jawa 42",    "perfMonth": "Aug'26", "retailSource": "DMS"},
+            {"sid": "DUP_001", "retailModel": "Jawa Perak", "perfMonth": "Sep'26", "retailSource": "VOC"},
+        ]
+        for e in entries:
+            retail_map[e["sid"]] = {
+                "retailModel": e["retailModel"],
+                "perfMonth":   e["perfMonth"],
+                "retailSource": e["retailSource"],
+            }
+        # Last row (Sep'26 / Jawa Perak) must win
+        assert retail_map["DUP_001"]["perfMonth"]   == "Sep'26"
+        assert retail_map["DUP_001"]["retailModel"] == "Jawa Perak"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

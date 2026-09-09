@@ -55,14 +55,21 @@ RETAIL_FILTER_VAL = "Jawa"   # brand filter for retail master
 
 # Google Sheet IDs (override via GitHub Secrets / environment variables)
 SHEET_JUL26 = os.getenv("JAWA_SHEET_ID_JUL26",  "1t29vI-JdKu7HDaaLX33N3wFnhylFLbOkwPhyWc6ZKiA")
-SHEET_AUG26 = os.getenv("JAWA_SHEET_ID_AUG26",  "")  # empty → use aug26_fallback
+SHEET_AUG26 = os.getenv("JAWA_SHEET_ID_AUG26",  "1WgyRvNW02UxCYyhQDLfaFa86RciciSeGXeQmBF7ymIg")
 SHEET_LIVE  = os.getenv("JAWA_SHEET_ID_LIVE",   "1MdlYzXsJ1rAZ1PfVDNXE7n8IGaHQuoW25QHh3tq6XRc")
 RETAIL_SHEET= os.getenv("JAWA_RETAIL_SHEET_ID", "1ZWBlzxX-g2R5iCcrsGUWrqSvxIHcchFHtajDDPcFJgE")
 JAWA_TAB    = os.getenv("JAWA_TAB_NAME",  "Jawa")
 RETAIL_TAB  = os.getenv("JAWA_RETAIL_TAB", "Raw")
 
-PROXY_URL    = os.getenv("JAWA_APPS_SCRIPT_URL",    "")
-PROXY_SECRET = os.getenv("JAWA_APPS_SCRIPT_SECRET", "")
+# The TVS Apps Script proxy is generic — it accepts any fileId the Google
+# account can access.  Set JAWA_APPS_SCRIPT_URL to the TVS proxy URL and
+# JAWA_APPS_SCRIPT_SECRET to the TVS secret if a separate Jawa proxy is not
+# deployed.  Both are required GitHub Secrets for the production workflow.
+_TVS_PROXY_URL    = "https://script.google.com/macros/s/AKfycbwdTKif3l3gYJKMwZBO6PjmYgNbWulkQ9TMEIsN-6xMdG2efbndnSoHE4tC63Oe6AKmlQ/exec"
+_TVS_PROXY_SECRET = "tvs2026push"
+
+PROXY_URL    = os.getenv("JAWA_APPS_SCRIPT_URL",    _TVS_PROXY_URL)
+PROXY_SECRET = os.getenv("JAWA_APPS_SCRIPT_SECRET", _TVS_PROXY_SECRET)
 
 # Model name merges (applied at extraction, must match existing dashboard)
 MODEL_MERGES = {
@@ -73,20 +80,34 @@ MODEL_MERGES = {
     # "2024 Yezdi Adventure" is NOT merged — left as-is
 }
 
-# Source type → dashboard source label
+# Source type → dashboard source label.
+# The Google Sheets (Jul'26+) use direct display labels (Organic, Google, Facebook, Non-MS).
+# The old Excel/CRM codes (CPC, FB, IMS) are kept for backward compatibility.
 SOURCE_MAP = {
-    "Organic": "Organic",
-    "CPC":     "Google",
-    "FB":      "Facebook",
-    "IMS":     "Non CPS",
+    # Google Sheet direct labels
+    "Organic":   "Organic",
+    "Google":    "Google",
+    "Facebook":  "Facebook",
+    "Non-MS":    "Non CPS",
+    "Whatsapp":  "Whatsapp",
+    # Legacy CRM codes (Excel sources)
+    "CPC":       "Google",
+    "FB":        "Facebook",
+    "IMS":       "Non CPS",
 }
 
-KNOWN_SOURCES = ["Facebook", "Google", "Non CPS", "Organic", "Unknown"]
+# Retail source: Call Type column values → dashboard retailSource label
+CALL_TYPE_MAP = {
+    "DMS":      "DMS",
+    "Call Out": "VOC",  # outbound verification call = voice of customer
+}
+
+KNOWN_SOURCES = ["Facebook", "Google", "Non CPS", "Organic", "Whatsapp", "Unknown"]
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────
 def month_order(m: str) -> int:
-    """'Sep'26' → 2609; 'May'25' → 2505. Raises ValueError on bad input."""
+    """'Sep'26' → 202609. Accepts both 2-digit ('26) and 4-digit ('2026) years."""
     m = str(m).strip()
     mo_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
     pat = re.match(r"^([A-Za-z]{3})'?(\d{2,4})$", m)
@@ -96,6 +117,21 @@ def month_order(m: str) -> int:
     mo = mo_names.index(name) + 1  # 1-based
     yr4 = int(yr) if len(yr) == 4 else (2000 + int(yr))
     return yr4 * 100 + mo
+
+
+def canon_month(m: str) -> str:
+    """Normalise any month string to 2-digit-year form: 'Jul'2026' → 'Jul'26'.
+    Handles ASCII apostrophe (U+0027) and Unicode RIGHT SINGLE QUOTATION MARK (U+2019).
+    """
+    m = str(m).strip().replace('’', "'").replace('‘', "'")
+    mo_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    pat = re.match(r"^([A-Za-z]{3})'?(\d{2,4})$", m)
+    if not pat:
+        return m
+    name, yr = pat.group(1).capitalize(), pat.group(2)
+    yr4 = int(yr) if len(yr) == 4 else (2000 + int(yr))
+    mo = mo_names.index(name) + 1
+    return f"{name}'{yr4 % 100:02d}"
 
 
 def norm_id(v) -> str:
@@ -174,26 +210,31 @@ def proxy_get(action: str, extra: dict, timeout: int = 90) -> dict:
             time.sleep(5 * (attempt + 1))
 
 
-def fetch_sheet(file_id: str, tab: str, label: str, page_size: int = 5000) -> pd.DataFrame:
-    """Fetch a full sheet via Apps Script proxy with pagination."""
+def fetch_sheet(file_id: str, tab: str, label: str, page_size: int = 2000) -> pd.DataFrame:
+    """Fetch a full sheet via Apps Script proxy with pagination.
+
+    Uses the TVS-compatible getSheetData action: response is
+    {headers:[...], rows:[[...],[...]], total:N, done:bool}.
+    Rows are arrays (positional), not dicts — pd.DataFrame handles both.
+    """
     log.info("Fetching %s (tab=%s)…", label, tab)
     all_rows = []
-    offset = 0
+    page = 0
     headers = None
     while True:
-        data = proxy_get("getRows", {
+        data = proxy_get("getSheetData", {
             "fileId": file_id, "tabName": tab,
-            "offset": offset, "limit": page_size,
+            "page": page, "pageSize": page_size,
         })
         if headers is None:
             headers = data.get("headers", [])
         rows = data.get("rows", [])
         all_rows.extend(rows)
-        log.info("  … %d rows fetched (offset %d)", len(all_rows), offset)
-        if not data.get("hasMore", False):
+        log.info("  … %d rows fetched (page %d, total reported %s)", len(all_rows), page, data.get("total", "?"))
+        if data.get("done", True):
             break
-        offset += len(rows)
-        time.sleep(0.5)
+        page += 1
+        time.sleep(0.3)
     df = pd.DataFrame(all_rows, columns=headers)
     log.info("  Total: %d rows from %s", len(df), label)
     return df
@@ -230,51 +271,64 @@ def _lead_col(df: pd.DataFrame, *names: str, required: bool = True):
 
 
 def standardise_lead_df(df: pd.DataFrame, expected_month: str | None = None) -> pd.DataFrame:
-    """Extract and normalise lead master columns → standard dict list."""
-    # Column discovery (flexible — sheets may vary slightly)
-    col_id      = _lead_col(df, "EnquiryId", "enquiryid", "enquiry_id", "opty_id")
-    col_month   = _lead_col(df, "Month", "Lead_Month", "LeadMonth", "lead_month")
-    col_date    = _lead_col(df, "Date", "CreateTime", "create_time")
-    col_model   = _lead_col(df, "Model", "model", required=False)
+    """Extract and normalise lead master columns → standard dict list.
+
+    Handles both the old Excel/CRM column names and the current Google Sheet
+    column names (oem_crm_id for dealer, Status_Name for status, Medium for
+    source type, DMS_Retail_Month / Ops_Retail_Month for performance month).
+    Lead_Month values are normalised to 2-digit-year form ('Jul'2026' → 'Jul'26').
+    """
+    # Column discovery — ordered: first match wins
+    col_id     = _lead_col(df, "opty_id", "EnquiryId", "enquiryid", "enquiry_id")
+    col_month  = _lead_col(df, "Lead_Month", "Month", "LeadMonth", "lead_month")
+    col_date   = _lead_col(df, "Date", "CreateTime", "create_time")
+    col_model  = _lead_col(df, "model", "Model", required=False)
     if not col_model:
-        # Some sheets have duplicate Model columns; pick the last one
         model_cols = [c for c in df.columns if str(c).strip().lower() == "model"]
         col_model = model_cols[-1] if model_cols else _lead_col(df, "Model")
-    col_type    = _lead_col(df, "Type", "type")
-    col_lt      = _lead_col(df, "Lead Type", "LeadType", "lead_type", "leadtype")
-    col_dealer  = _lead_col(df, "L1 Dealer Code", "Dealer Code", "dealer_code", "L1DealerCode")
-    col_d_name  = _lead_col(df, "L1 Organization Name", "DealerName", "dealer_name", required=False)
-    col_d_city  = _lead_col(df, "L1 Dealer City", "DealerCity", "dealer_city", required=False)
-    col_d_state = _lead_col(df, "State", "state", required=False)
-    col_mobile  = _lead_col(df, "Consumer Mobile Number", "Mobile", "mobile", "Consumer Mobile")
-    col_status  = _lead_col(df, "Current Status", "current_status")
-    col_qual    = _lead_col(df, "Qualified Status", "qualified_status")
-    col_scat    = _lead_col(df, "Status Category", "status_category")
-    col_rmodel  = _lead_col(df, "Retail Purchased Model", "Retail Model", required=False)
-    col_rby     = _lead_col(df, "Retail Updated By", "Retail By", "retail_by", required=False)
-    col_pm      = _lead_col(df, "Performance Month", "performanceMonth", required=False)
+    # Source: Google Sheet uses "Medium"; legacy Excel uses "Type"
+    col_type   = _lead_col(df, "Medium", "Type", "type", required=False)
+    col_lt     = _lead_col(df, "lead_type", "Lead Type", "LeadType", "leadtype", required=False)
+    # Dealer: Google Sheet uses "oem_crm_id"; legacy Excel uses "L1 Dealer Code"
+    col_dealer = _lead_col(df, "oem_crm_id", "L1 Dealer Code", "Dealer Code", "dealer_code", "L1DealerCode", required=False)
+    col_d_name = _lead_col(df, "Dealer_Name", "L1 Organization Name", "DealerName", "dealer_name", required=False)
+    col_d_city = _lead_col(df, "City", "L1 Dealer City", "DealerCity", "dealer_city", required=False)
+    col_d_state= _lead_col(df, "State", "state", required=False)
+    # Mobile: Google Sheet uses encrypted mobile; keep it as opaque token (join never uses mobile)
+    col_mobile = _lead_col(df, "encrypt_mobile_number", "Consumer Mobile Number", "Mobile", "mobile", required=False)
+    # Status: Google Sheet uses "Status_Name"; legacy Excel uses "Current Status"
+    col_status = _lead_col(df, "Status_Name", "Current Status", "current_status", required=False)
+    # Qualified status and status category not present in Google Sheets — optional
+    col_qual   = _lead_col(df, "Qualified Status", "qualified_status", required=False)
+    col_scat   = _lead_col(df, "Status Category", "status_category", required=False)
+    # Retail fields in lead sheet: may be overridden by Retail Master
+    col_rmodel = _lead_col(df, "Retail Purchased Model", "Retail Model", required=False)
+    col_rby    = _lead_col(df, "Retail Updated By", "Retail By", "retail_by", required=False)
+    # Performance month: Google Sheet uses DMS_Retail_Month / Ops_Retail_Month
+    col_pm     = _lead_col(df, "DMS_Retail_Month", "Ops_Retail_Month", "Performance Month", "performanceMonth", required=False)
 
-    # Validate opty_id column exists
     if not col_id:
-        fail_exit("lead_cols", "opty_id column (EnquiryId) not found in lead sheet.")
+        fail_exit("lead_cols", "opty_id column not found in lead sheet.")
 
     records = []
     for _, row in df.iterrows():
         oid = norm_id(row[col_id])
         if not oid:
-            continue  # skip rows without opty_id
-
-        month_raw = str(row[col_month]).strip() if col_month else ""
-        try:
-            month_order(month_raw)  # validate
-        except ValueError:
             continue
 
+        month_raw_orig = str(row[col_month]).strip() if col_month else ""
+        try:
+            month_order(month_raw_orig)
+        except ValueError:
+            continue
+        # Normalise to 2-digit-year canonical form for all comparisons
+        month_raw = canon_month(month_raw_orig)
+
         if expected_month and month_raw != expected_month:
-            continue  # skip rows outside expected month
+            continue
 
         model_raw = str(row[col_model]).strip() if col_model else "Unknown"
-        model = norm_model(model_raw) if model_raw else "Unknown"
+        model = norm_model(model_raw) if model_raw and model_raw != "nan" else "Unknown"
 
         source_type = str(row[col_type]).strip() if col_type else ""
         source = norm_source(source_type)
@@ -282,18 +336,23 @@ def standardise_lead_df(df: pd.DataFrame, expected_month: str | None = None) -> 
         dealer_code = str(row[col_dealer]).strip().rstrip("_").strip() if col_dealer else "Unknown"
         dealer_name = str(row[col_d_name]).strip() if col_d_name else ""
         dealer_city = str(row[col_d_city]).strip().lower() if col_d_city else ""
-        dealer_state = str(row[col_d_state]).strip() if col_d_state else ""
+        dealer_state= str(row[col_d_state]).strip() if col_d_state else ""
 
-        mobile_raw = str(row[col_mobile]) if col_mobile else ""
-        mobile_norm = norm_mobile(mobile_raw)
+        mobile_raw  = str(row[col_mobile]) if col_mobile else ""
+        # Encrypted mobile cannot be normalised to a phone number; store raw token
+        mobile_norm = mobile_raw.strip() if mobile_raw and mobile_raw not in ("nan", "") else ""
 
-        # Retail fields from lead master (may be overridden by Retail Master later)
         rmodel_raw = str(row[col_rmodel]).strip() if col_rmodel else ""
         rmodel = norm_model(rmodel_raw) if rmodel_raw and rmodel_raw != "nan" else None
 
         perf_month = str(row[col_pm]).strip() if col_pm else None
         if perf_month in ("", "nan", "None"):
             perf_month = None
+        if perf_month:
+            try:
+                perf_month = canon_month(perf_month)
+            except Exception:
+                perf_month = None
 
         rby_raw = str(row[col_rby]).strip() if col_rby else ""
         retail_src = "DMS" if "DMS" in rby_raw.upper() else ("VOC" if rby_raw else "")
@@ -339,55 +398,80 @@ def fetch_retail_master(live_months: list[str]) -> dict[str, dict]:
     """
     Fetch Jawa retails from Retail Master for the rolling window.
     Returns retail_map: {sourceLeadId → {retailModel, perfMonth, retailSource}}
+
+    Retail Master column layout (actual schema, confirmed 2026-09-09):
+      sourceLeadId          — join key (opty_id = sourceLeadId)
+      Process               — brand identifier (filter: 'Jawa')
+      Retail Attribution Month — month string 'Sep'26' (rolling window filter)
+      purchasedModel        — retail model name
+      Call Type             — 'DMS' or 'Call Out' (→ DMS / VOC)
     """
     log.info("Fetching Retail Master (rolling window: %s)…", live_months)
     df = fetch_sheet(RETAIL_SHEET, RETAIL_TAB, "Retail Master")
 
-    # Discover columns
     cols = [str(c).strip() for c in df.columns]
     df.columns = cols
 
-    brand_col = next((c for c in cols if "brand" in c.lower()), None)
+    # Brand: "Process" column (value = "Jawa"); fall back to legacy "brand" column
+    brand_col = next((c for c in cols if c == "Process" or "brand" in c.lower()), None)
     id_col    = next((c for c in cols if c.lower() in ("sourceleadid", "source_lead_id", "sourcelead_id")), None)
-    pm_col    = next((c for c in cols if c.lower() in ("performancemonth", "performance_month", "performance month")), None)
-    rm_col    = next((c for c in cols if c.lower() in ("model", "retailmodel", "retail model", "purchased model")), None)
-    rb_col    = next((c for c in cols if c.lower() in ("retail by", "retailby", "retail_by", "type")), None)
+    # Performance month: prefer "Retail Attribution Month" (contains "Sep'26" strings) over
+    # "performanceMonth" (contains raw dates like "2026-09-01"). Must check explicitly because
+    # performanceMonth appears earlier in the column list and would be matched first by a combined search.
+    pm_col = next((c for c in cols if c.lower() == "retail attribution month"), None)
+    if pm_col is None:
+        pm_col = next((c for c in cols if c.lower() in ("performancemonth",
+                                                          "performance_month", "performance month")), None)
+    rm_col    = next((c for c in cols if c.lower() in ("purchasedmodel", "purchased model",
+                                                         "model", "retailmodel", "retail model")), None)
+    # Call Type: 'DMS' → "DMS", 'Call Out' → "VOC"
+    rb_col    = next((c for c in cols if c.lower() in ("call type", "calltype", "retail by", "retailby", "retail_by")), None)
 
     if not id_col:
         fail_exit("retail_cols", f"sourceLeadId column not found. Columns: {cols[:20]}")
     if not pm_col:
-        fail_exit("retail_cols", f"performanceMonth column not found. Columns: {cols[:20]}")
+        fail_exit("retail_cols", f"performanceMonth / Retail Attribution Month not found. Columns: {cols[:20]}")
 
-    # Filter by brand = Jawa
+    # Filter by brand = Jawa (using Process column, value 'Jawa')
     if brand_col:
-        df = df[df[brand_col].str.strip().str.lower() == RETAIL_FILTER_VAL.lower()]
+        df = df[df[brand_col].astype(str).str.strip().str.lower() == RETAIL_FILTER_VAL.lower()]
         log.info("  After Jawa filter: %d retail rows", len(df))
 
-    # Filter by rolling month window
+    # Filter by rolling month window — pm_col contains month strings like "Sep'26"
     window_set = set(live_months)
-    if pm_col:
-        mask = df[pm_col].apply(lambda x: str(x).strip() in window_set)
-        df = df[mask]
-        log.info("  After rolling window (%s): %d rows", live_months, len(df))
+    mask = df[pm_col].apply(lambda x: canon_month(str(x).strip()) in window_set if x else False)
+    df = df[mask]
+    log.info("  After rolling window (%s): %d rows", live_months, len(df))
 
     retail_map: dict[str, dict] = {}
+    dup_count = 0
     for _, row in df.iterrows():
         sid = norm_id(row[id_col])
         if not sid:
             continue
         rmodel_raw = str(row[rm_col]).strip() if rm_col else ""
         rmodel = norm_model(rmodel_raw) if rmodel_raw and rmodel_raw != "nan" else None
-        perf_m = str(row[pm_col]).strip()
+        perf_m_raw = str(row[pm_col]).strip()
+        try:
+            perf_m = canon_month(perf_m_raw)
+        except Exception:
+            perf_m = perf_m_raw
 
-        rby = str(row[rb_col]).strip() if rb_col else ""
-        rsrc = "DMS" if "DMS" in rby.upper() else ("VOC" if rby else "")
+        ct = str(row[rb_col]).strip() if rb_col else ""
+        rsrc = CALL_TYPE_MAP.get(ct, "DMS" if "DMS" in ct.upper() else "")
 
+        if sid in retail_map:
+            dup_count += 1
+        # Last row wins if sourceLeadId appears multiple times (duplicate retail records).
+        # A lead can only retail once; duplicates are treated as data entry errors.
         retail_map[sid] = {
             "retailModel":  rmodel,
             "perfMonth":    perf_m,
             "retailSource": rsrc,
         }
 
+    if dup_count:
+        log.warning("  Retail Master: %d duplicate sourceLeadId rows (last-row-wins applied)", dup_count)
     log.info("  Retail map: %d unique sourceLeadId entries", len(retail_map))
     return retail_map
 
@@ -697,14 +781,14 @@ def run(dry_run: bool = False) -> None:
         aug26_rows = fetch_lead_month(SHEET_AUG26, JAWA_TAB, "Aug'26-LeadMaster", "Aug'26")
         log.info("Step 4 OK — Aug'26 from Google Sheet: %d rows", len(aug26_rows))
     else:
-        # Use fallback from existing dashboard (no opty_id — retail reconciliation skipped)
-        if not AUG26_FALLBACK.exists():
-            fail_exit("aug26_fallback", f"Aug'26 sheet not configured and fallback not found: {AUG26_FALLBACK}")
-        with gzip.open(AUG26_FALLBACK, "rt", encoding="utf-8") as f:
-            aug_cache = json.load(f)
-        aug26_rows = aug_cache["rows"]
-        log.warning("Step 4 — Aug'26 from fallback (no opty_id; retail reconciliation disabled for Aug'26)")
-        log.info("         Aug'26 fallback: %d rows, %d retails", len(aug26_rows), aug_cache.get("total_retails",0))
+        # aug26_fallback has no opty_id — retail reconciliation cannot be performed.
+        # Hard failure is required; do not silently publish August data without retail joins.
+        fail_exit(
+            "aug26_no_opty_id",
+            "JAWA_SHEET_ID_AUG26 is not configured. "
+            "The aug26_fallback has no opty_id — retail reconciliation cannot be performed. "
+            "Set the JAWA_SHEET_ID_AUG26 GitHub Secret to the Aug'26 Lead Master sheet ID and re-run.",
+        )
 
     # ── Step 5: Fetch current-month Lead Master (Sep'26+) ─────────────────
     cur_rows = fetch_lead_month(SHEET_LIVE, JAWA_TAB, f"{cur_mo}-LeadMaster", cur_mo)
