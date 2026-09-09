@@ -1,0 +1,18 @@
+{
+  "run_utc": "2026-09-09T09:19:43.136052",
+  "frozen_rows": 315816,
+  "jul26_rows": 28830,
+  "aug26_rows": 37197,
+  "aug26_source": "sheet",
+  "cur_month": "Sep'26",
+  "cur_month_rows": 7583,
+  "retail_window": [
+    "Sep'26",
+    "Aug'26",
+    "Jul'26"
+  ],
+  "retail_map_size": 1048,
+  "total_rows": 389426,
+  "total_retails": 6623,
+  "validation": "PASS"
+}
