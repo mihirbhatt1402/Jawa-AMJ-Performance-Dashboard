@@ -1,5 +1,5 @@
 {
-  "run_utc": "2026-09-10T04:28:50.119273",
+  "run_utc": "2026-09-10T08:41:02.011496",
   "frozen_rows": 315816,
   "jul26_rows": 28830,
   "aug26_rows": 37197,
@@ -11,8 +11,8 @@
     "Aug'26",
     "Jul'26"
   ],
-  "retail_map_size": 1052,
+  "retail_map_size": 312,
   "total_rows": 390526,
-  "total_retails": 6628,
+  "total_retails": 6219,
   "validation": "PASS"
 }
