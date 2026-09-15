@@ -407,7 +407,9 @@ def fetch_retail_master(live_months: list[str]) -> dict[str, dict]:
       Call Type             — 'DMS' or 'Call Out' (→ DMS / VOC)
     """
     log.info("Fetching Retail Master (rolling window: %s)…", live_months)
-    df = fetch_sheet(RETAIL_SHEET, RETAIL_TAB, "Retail Master")
+    # page_size=1000: keeps each page response below the Apps Script content-delivery
+    # redirect threshold (~2MB), avoiding intermittent 404s on user_content_key URLs.
+    df = fetch_sheet(RETAIL_SHEET, RETAIL_TAB, "Retail Master", page_size=1000)
 
     cols = [str(c).strip() for c in df.columns]
     df.columns = cols
