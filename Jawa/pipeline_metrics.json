@@ -1,18 +1,18 @@
 {
-  "run_utc": "2026-09-15T04:37:23.827461",
+  "run_utc": "2026-09-16T04:04:52.656495",
   "frozen_rows": 315816,
   "jul26_rows": 28830,
   "aug26_rows": 37197,
   "aug26_source": "sheet",
   "cur_month": "Sep'26",
-  "cur_month_rows": 15835,
+  "cur_month_rows": 17011,
   "retail_window": [
     "Sep'26",
     "Aug'26",
     "Jul'26"
   ],
-  "retail_map_size": 1095,
-  "total_rows": 397678,
-  "total_retails": 6671,
+  "retail_map_size": 1158,
+  "total_rows": 398854,
+  "total_retails": 6730,
   "validation": "PASS"
 }
